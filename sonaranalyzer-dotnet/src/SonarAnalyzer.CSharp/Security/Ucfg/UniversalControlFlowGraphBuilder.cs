@@ -161,18 +161,121 @@ namespace SonarAnalyzer.Security.Ucfg
             }
         }
 
+        private class BlockBuilder
+        {
+            private readonly BasicBlock basicBlock;
+
+            public BlockBuilder(BasicBlock basicBlock)
+            {
+                this.basicBlock = basicBlock;
+            }
+
+            public Expression AddAssignment(SyntaxNode syntaxNode, string variable, Expression argument)
+            {
+                var instruction = CreateInstruction(syntaxNode, KnownMethodId.Assignment, variable, argument);
+                return CreateVariableExpression(instruction.Variable);
+            }
+
+            public Expression AddConcatenation(SyntaxNode syntaxNode, params Expression[] arguments)
+            {
+                var instruction = CreateInstruction(syntaxNode, KnownMethodId.Concatenation, CreateTempVariable(), arguments);
+                return CreateVariableExpression(instruction.Variable);
+            }
+
+            public Expression AddMethodCall(SyntaxNode invocation, IMethodSymbol methodSymbol, params Expression[] arguments)
+            {
+                // Add instruction to UCFG only when the method accepts/returns string,
+                // or when at least one of its arguments is known to be a string.
+                // Since we generate Const expressions for everything that is not
+                // a string, checking if the arguments are Var expressions should
+                // be enough to ensure they are strings.
+                if (!AcceptsOrReturnsString(methodSymbol) &&
+                    !arguments.Any(IsVariable))
+                {
+                    return ConstantExpression;
+                }
+
+                var instruction = CreateInstruction(
+                    invocation,
+                    methodId: GetMethodId(methodSymbol),
+                    variable: CreateTempVariable(),
+                    arguments: arguments);
+
+                return methodSymbol.ReturnType.Is(KnownType.System_String)
+                    ? CreateVariableExpression(instruction.Variable)
+                    : ConstantExpression;
+
+                bool IsVariable(Expression expression) =>
+                    expression.Var != null;
+            }
+
+            public void CreateAttributeInstructions(IParameterSymbol parameter)
+            {
+                foreach (var attribute in parameter.GetAttributes().Where(a => a.AttributeConstructor != null))
+                {
+                    var attributeVariable = CreateTempVariable();
+
+                    CreateInstruction(
+                        syntaxNode: attribute.ApplicationSyntaxReference.GetSyntax(),
+                        methodId: GetMethodId(attribute.AttributeConstructor),
+                        variable: attributeVariable);
+
+                    CreateInstruction(
+                        syntaxNode: attribute.ApplicationSyntaxReference.GetSyntax(),
+                        methodId: KnownMethodId.Annotation,
+                        variable: parameter.Name,
+                        arguments: CreateVariableExpression(attributeVariable));
+                }
+            }
+
+            public void CreateEntryPointInstruction(BaseMethodDeclarationSyntax methodDeclaration)
+            {
+                CreateInstruction(
+                    syntaxNode: methodDeclaration,
+                    methodId: KnownMethodId.EntryPoint,
+                    variable: CreateTempVariable(),
+                    arguments: methodDeclaration.ParameterList.Parameters
+                        .Select(GetParameterName)
+                        .Select(CreateVariableExpression)
+                        .ToArray());
+
+                string GetParameterName(ParameterSyntax parameter) =>
+                    parameter.Identifier.ValueText;
+            }
+
+
+            private Instruction CreateInstruction(SyntaxNode syntaxNode, string methodId, string variable, params Expression[] arguments)
+            {
+                var instruction = new Instruction
+                {
+                    Location = GetLocation(syntaxNode),
+                    MethodId = methodId,
+                    Variable = variable ?? ConstantExpression.Const.Value,
+                };
+                instruction.Args.AddRange(arguments);
+                basicBlock.Instructions.Add(instruction);
+                return instruction;
+            }
+
+            public static Expression CreateVariableExpression(string name) =>
+                new Expression { Var = new Variable { Name = name } };
+
+            private int tempVariablesCounter;
+
+            private string CreateTempVariable() =>
+                $"%{tempVariablesCounter++}";
+        }
+
         private class InstructionBuilder
         {
             private readonly Dictionary<SyntaxNode, Expression> nodeExpressionMap = new Dictionary<SyntaxNode, Expression>();
             private readonly SemanticModel semanticModel;
-            private readonly BasicBlock basicBlock;
+            private readonly BlockBuilder blockBuilder;
 
-            private int tempVariablesCounter;
-
-            public InstructionBuilder(SemanticModel semanticModel, BasicBlock basicBlock)
+            public InstructionBuilder(SemanticModel semanticModel, BlockBuilder blockBuilder)
             {
                 this.semanticModel = semanticModel;
-                this.basicBlock = basicBlock;
+                this.blockBuilder = blockBuilder;
             }
 
             public Expression BuildInstruction(SyntaxNode syntaxNode) =>
@@ -221,7 +324,7 @@ namespace SonarAnalyzer.Security.Ucfg
 
                 var arguments = BuildArguments(objectCreation.ArgumentList).ToArray();
 
-                return AddMethodCall(objectCreation, ctorSymbol, arguments);
+                return blockBuilder.AddMethodCall(objectCreation, ctorSymbol, arguments);
             }
 
             private Expression BuildIdentifierName(IdentifierNameSyntax identifier)
@@ -230,15 +333,11 @@ namespace SonarAnalyzer.Security.Ucfg
 
                 if (identifierSymbol is IPropertySymbol property)
                 {
-                    var instruction = CreateInstruction(
-                        identifier,
-                        methodId: GetMethodId(property.GetMethod),
-                        variable: CreateTempVariable());
-                    return CreateVariableExpression(instruction.Variable);
+                    return blockBuilder.AddMethodCall(identifier, property.GetMethod);
                 }
                 else if (IsLocalVarOrParameterOfTypeString(identifierSymbol))
                 {
-                    return CreateVariableExpression(identifierSymbol.Name);
+                    return BlockBuilder.CreateVariableExpression(identifierSymbol.Name);
                 }
                 else
                 {
@@ -256,23 +355,14 @@ namespace SonarAnalyzer.Security.Ucfg
                 var variable = semanticModel.GetDeclaredSymbol(variableDeclarator);
                 if (IsLocalVarOrParameterOfTypeString(variable))
                 {
-                    CreateInstruction(
-                        variableDeclarator,
-                        methodId: KnownMethodId.Assignment,
-                        variable: variable.Name,
-                        arguments: BuildInstruction(variableDeclarator.Initializer.Value));
+                    blockBuilder.AddAssignment(variableDeclarator, variable.Name, BuildInstruction(variableDeclarator.Initializer.Value));
                 }
             }
 
             private Expression BuildBinaryExpression(BinaryExpressionSyntax binaryExpression)
             {
-                var instruction = CreateInstruction(
-                    binaryExpression,
-                    methodId: KnownMethodId.Concatenation,
-                    variable: CreateTempVariable(),
-                    arguments: new[] { BuildInstruction(binaryExpression.Right), BuildInstruction(binaryExpression.Left) });
-
-                return CreateVariableExpression(instruction.Variable);
+                return blockBuilder.AddConcatenation(binaryExpression,
+                    new[] { BuildInstruction(binaryExpression.Right), BuildInstruction(binaryExpression.Left) });
             }
 
             private void BuildReturn(ReturnStatementSyntax returnStatement)
@@ -300,7 +390,7 @@ namespace SonarAnalyzer.Security.Ucfg
                 // should add 'str1 + str2' and 'StoreInDb(string)', but not 'void LogStatus(int)'
                 var arguments = BuildArguments(invocation, methodSymbol).ToArray();
 
-                return AddMethodCall(invocation, methodSymbol, arguments);
+                return blockBuilder.AddMethodCall(invocation, methodSymbol, arguments);
             }
 
             private IEnumerable<Expression> BuildArguments(ArgumentListSyntax argumentList)
@@ -347,17 +437,12 @@ namespace SonarAnalyzer.Security.Ucfg
 
                 if (IsLocalVarOrParameterOfTypeString(left))
                 {
-                    var instruction = CreateInstruction(
-                        assignment,
-                        methodId: KnownMethodId.Assignment,
-                        variable: left.Name,
-                        arguments: right);
-                    return CreateVariableExpression(instruction.Variable);
+                    return blockBuilder.AddAssignment(assignment, left.Name, right);
                 }
                 else if (left is IPropertySymbol property &&
                     property.SetMethod != null)
                 {
-                    return AddMethodCall(assignment, property.SetMethod, right);
+                    return blockBuilder.AddMethodCall(assignment, property.SetMethod, right);
                 }
                 else
                 {
@@ -365,103 +450,24 @@ namespace SonarAnalyzer.Security.Ucfg
                 }
             }
 
-            private static bool IsExtensionMethodCalledAsExtension(IMethodSymbol methodSymbol) =>
-                methodSymbol.ReducedFrom != null;
-
-            private static bool IsInstanceMethodOnString(IMethodSymbol methodSymbol) =>
-                methodSymbol.ContainingType.Is(KnownType.System_String) && !methodSymbol.IsStatic;
-
-            private static bool IsLocalVarOrParameterOfTypeString(ISymbol symbol) =>
-                symbol is ILocalSymbol local && local.Type.Is(KnownType.System_String) ||
-                symbol is IParameterSymbol parameter && parameter.Type.Is(KnownType.System_String);
-
-            private Expression AddMethodCall(SyntaxNode invocation, IMethodSymbol methodSymbol, params Expression[] arguments)
-            {
-                // Add instruction to UCFG only when the method accepts/returns string,
-                // or when at least one of its arguments is known to be a string.
-                // Since we generate Const expressions for everything that is not
-                // a string, checking if the arguments are Var expressions should
-                // be enough to ensure they are strings.
-                if (!AcceptsOrReturnsString(methodSymbol) &&
-                    !arguments.Any(IsVariable))
-                {
-                    return ConstantExpression;
-                }
-
-                var instruction = CreateInstruction(
-                    invocation,
-                    methodId: GetMethodId(methodSymbol),
-                    variable: CreateTempVariable(),
-                    arguments: arguments);
-
-                return methodSymbol.ReturnType.Is(KnownType.System_String)
-                    ? CreateVariableExpression(instruction.Variable)
-                    : ConstantExpression;
-
-                bool IsVariable(Expression expression) =>
-                    expression.Var != null;
-            }
-
-            private Instruction CreateInstruction(SyntaxNode syntaxNode, string methodId, string variable, params Expression[] arguments)
-            {
-                var instruction = new Instruction
-                {
-                    Location = GetLocation(syntaxNode),
-                    MethodId = methodId,
-                    Variable = variable ?? ConstantExpression.Const.Value,
-                };
-                instruction.Args.AddRange(arguments);
-                basicBlock.Instructions.Add(instruction);
-                return instruction;
-            }
-
-            private string CreateTempVariable() =>
-                $"%{tempVariablesCounter++}";
-
-            private static Expression CreateVariableExpression(string name) =>
-                new Expression { Var = new Variable { Name = name } };
-
             private ISymbol GetSymbol(SyntaxNode syntaxNode) =>
                 semanticModel.GetSymbolInfo(syntaxNode).Symbol;
 
-            private static bool AcceptsOrReturnsString(IMethodSymbol methodSymbol) =>
-                methodSymbol.ReturnType.Is(KnownType.System_String) ||
-                methodSymbol.Parameters.Any(p => p.Type.Is(KnownType.System_String));
-
-            public void CreateAttributeInstructions(IParameterSymbol parameter)
-            {
-                foreach (var attribute in parameter.GetAttributes().Where(a => a.AttributeConstructor != null))
-                {
-                    var attributeVariable = CreateTempVariable();
-
-                    CreateInstruction(
-                        syntaxNode: attribute.ApplicationSyntaxReference.GetSyntax(),
-                        methodId: GetMethodId(attribute.AttributeConstructor),
-                        variable: attributeVariable);
-
-                    CreateInstruction(
-                        syntaxNode: attribute.ApplicationSyntaxReference.GetSyntax(),
-                        methodId: KnownMethodId.Annotation,
-                        variable: parameter.Name,
-                        arguments: CreateVariableExpression(attributeVariable));
-                }
-            }
-
-            public void CreateEntryPointInstruction(BaseMethodDeclarationSyntax methodDeclaration)
-            {
-                CreateInstruction(
-                    syntaxNode: methodDeclaration,
-                    methodId: KnownMethodId.EntryPoint,
-                    variable: CreateTempVariable(),
-                    arguments: methodDeclaration.ParameterList.Parameters
-                        .Select(GetParameterName)
-                        .Select(CreateVariableExpression)
-                        .ToArray());
-
-                string GetParameterName(ParameterSyntax parameter) =>
-                    parameter.Identifier.ValueText;
-            }
         }
+
+        private static bool IsExtensionMethodCalledAsExtension(IMethodSymbol methodSymbol) =>
+            methodSymbol.ReducedFrom != null;
+
+        private static bool IsInstanceMethodOnString(IMethodSymbol methodSymbol) =>
+            methodSymbol.ContainingType.Is(KnownType.System_String) && !methodSymbol.IsStatic;
+
+        private static bool IsLocalVarOrParameterOfTypeString(ISymbol symbol) =>
+            symbol is ILocalSymbol local && local.Type.Is(KnownType.System_String) ||
+            symbol is IParameterSymbol parameter && parameter.Type.Is(KnownType.System_String);
+
+        private static bool AcceptsOrReturnsString(IMethodSymbol methodSymbol) =>
+            methodSymbol.ReturnType.Is(KnownType.System_String) ||
+            methodSymbol.Parameters.Any(p => p.Type.Is(KnownType.System_String));
 
         private class BlockIdMap
         {
